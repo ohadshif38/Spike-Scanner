@@ -35,14 +35,24 @@ st.markdown("""
 # גרסאות שמורות במטמון של משיכת הנתונים
 # ---------------------------------------------------------------------------
 
+class EmptyResult(Exception):
+    """נזרק כשמקור מחזיר תוצאה ריקה, כדי שהמטמון לא ישמור כישלון."""
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def c_universe(min_cap, max_cap, min_price, min_vol, majors):
-    return src.get_universe(min_cap, max_cap, min_price, min_vol, majors)
+def c_universe(min_cap, max_cap, min_price, min_vol, majors, max_n):
+    df, errs = src.get_universe(min_cap, max_cap, min_price, min_vol, majors, max_n)
+    if df.empty:
+        raise EmptyResult(" | ".join(errs) or "לא התקבלו מניות")
+    return df, errs
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def c_history(tickers: tuple[str, ...]):
-    return src.get_history(list(tickers))
+    out = src.get_history(list(tickers))
+    if not out:
+        raise EmptyResult("Yahoo לא החזיר נתוני מחיר (ייתכן שחוסם זמנית את השרת)")
+    return out
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -94,6 +104,8 @@ with st.sidebar:
         min_price = st.number_input("מחיר מינימלי ($)", 0.05, 50.0, 0.5, 0.05)
         min_vol = st.number_input("מחזור יומי ממוצע מינימלי (מניות)", 0, 5_000_000, 100_000, 50_000)
         majors = st.checkbox("רק NASDAQ / NYSE / AMEX (בלי OTC)", True)
+        max_n = st.slider("כמה מניות לסרוק", 100, 600, 300, 50,
+                          help="מתוך כל המניות בטווח, הכי פעילות והכי מזנקות היום. יותר מניות = סריקה איטית יותר")
         deep_n = st.slider("כמה מניות לנתח לעומק", 10, 80, 30,
                            help="המניות המובילות בשלב הראשון מקבלות ניתוח מלא: Float, שורט, חדשות, דיווחים")
         watchlist = st.text_input("רשימת מעקב (מופרדת בפסיקים)", "",
@@ -128,18 +140,27 @@ def run_scan():
     log: list[str] = []
     prog = st.progress(0.0, "מאתר מניות שעומדות בסינון...")
 
-    uni, errs = c_universe(cap_min * 1e6, cap_max * 1e6, min_price, min_vol, majors)
-    log += errs
+    try:
+        uni, errs = c_universe(cap_min * 1e6, cap_max * 1e6, min_price, min_vol, majors, max_n)
+        log += errs
+    except EmptyResult as e:
+        uni = pd.DataFrame()
+        log.append(f"איתור מניות נכשל: {e}")
     wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
     tickers = list(dict.fromkeys((uni["ticker"].tolist() if not uni.empty else []) + wl))
     if not tickers:
         prog.empty()
-        st.error("לא נמצאו מניות. אם Yahoo לא זמין כרגע, נסו להזין רשימת מעקב ולהריץ שוב.")
+        st.error("לא נמצאו מניות. " + " ".join(log) + " נסו שוב בעוד כמה דקות, או הזינו רשימת מעקב.")
         return
     meta = uni.set_index("ticker").to_dict("index") if not uni.empty else {}
 
     prog.progress(0.15, f"מוריד היסטוריית מחירים ל-{len(tickers)} מניות...")
-    hist = c_history(tuple(sorted(tickers)))
+    try:
+        hist = c_history(tuple(sorted(tickers)))
+    except EmptyResult as e:
+        prog.empty()
+        st.error(f"נמצאו {len(tickers)} מניות, אבל {e}. נסו שוב בעוד כמה דקות.")
+        return
 
     prog.progress(0.45, "בודק אזכורים ברשתות...")
     ape = c_apewisdom()
@@ -355,7 +376,10 @@ with tab_scan:
                 with left:
                     ch1, ch2 = st.tabs(["גרף יומי", "תוך-יומי (כולל Pre-market)"])
                     with ch1:
-                        h = c_history((pick,)).get(pick)
+                        try:
+                            h = c_history((pick,)).get(pick)
+                        except EmptyResult:
+                            h = None
                         if h is not None and not h.empty:
                             st.plotly_chart(daily_chart(h, pick), use_container_width=True)
                     with ch2:

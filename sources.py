@@ -33,8 +33,54 @@ def _get_json(url: str, headers: dict | None = None, params: dict | None = None,
 # יקום המניות (Yahoo screener דרך yfinance)
 # ---------------------------------------------------------------------------
 
+def _num(val) -> float:
+    try:
+        return float(str(val).replace("$", "").replace(",", "").replace("%", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def get_universe_nasdaq(min_cap: float, max_cap: float, min_price: float, min_vol: float,
+                        max_n: int) -> tuple[pd.DataFrame, list[str]]:
+    """כל המניות ב-NASDAQ/NYSE/AMEX בבקשה אחת, מהסורק הציבורי של nasdaq.com."""
+    headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*",
+               "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"}
+    data = _get_json("https://api.nasdaq.com/api/screener/stocks", headers=headers,
+                     params={"tableonly": "true", "limit": "25000", "download": "true"}, timeout=30)
+    if not data or not data.get("data"):
+        return pd.DataFrame(), ["הסורק של Nasdaq לא הגיב"]
+    d = data["data"]
+    rows = d.get("rows") or (d.get("table") or {}).get("rows") or []
+    recs = []
+    for r in rows:
+        sym = str(r.get("symbol", "")).strip().upper()
+        if not re.fullmatch(r"[A-Z]{1,5}", sym):
+            continue  # מדלג על Warrants, Units ומניות בכורה
+        mcap, price, vol = _num(r.get("marketCap")), _num(r.get("lastsale")), _num(r.get("volume"))
+        if not (min_cap <= mcap <= max_cap) or price < min_price or vol < min_vol / 2:
+            continue
+        recs.append({"ticker": sym, "name": r.get("name", ""), "exchange": "", "mcap": mcap,
+                     "q_price": price, "q_chg": _num(r.get("pctchange")), "q_vol": vol})
+    df = pd.DataFrame(recs)
+    if df.empty:
+        return df, ["הסורק של Nasdaq החזיר 0 מניות בטווח"]
+    # לא מורידים היסטוריה לאלפי מניות: לוקחים את הפעילות ביותר ואת המזנקות ביותר
+    by_vol = df.assign(dv=df.q_vol * df.q_price).nlargest(int(max_n * 0.6), "dv")
+    by_chg = df.nlargest(int(max_n * 0.4), "q_chg")
+    return pd.concat([by_vol, by_chg]).drop_duplicates("ticker").drop(columns="dv", errors="ignore"), []
+
+
 def get_universe(min_cap: float, max_cap: float, min_price: float, min_avg_vol: float,
-                 majors_only: bool = True) -> tuple[pd.DataFrame, list[str]]:
+                 majors_only: bool = True, max_n: int = 300) -> tuple[pd.DataFrame, list[str]]:
+    df, errors = get_universe_nasdaq(min_cap, max_cap, min_price, min_avg_vol, max_n)
+    if not df.empty:
+        return df, []
+    df2, errors2 = get_universe_yahoo(min_cap, max_cap, min_price, min_avg_vol, majors_only)
+    return df2, errors + errors2
+
+
+def get_universe_yahoo(min_cap: float, max_cap: float, min_price: float, min_avg_vol: float,
+                       majors_only: bool = True) -> tuple[pd.DataFrame, list[str]]:
     from yfinance import EquityQuery as EQ
 
     errors: list[str] = []
