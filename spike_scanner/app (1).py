@@ -1,0 +1,670 @@
+"""
+סורק מומנטום למניות קטנות
+הרצה:  streamlit run app.py
+"""
+from __future__ import annotations
+
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+import backtest as bt
+import scoring as sc
+import sources as src
+
+st.set_page_config(page_title="סורק מניות קטנות", page_icon="📡", layout="wide")
+
+st.markdown("""
+<style>
+[data-testid="stMarkdownContainer"], [data-testid="stHeading"], [data-testid="stCaptionContainer"],
+[data-testid="stAlert"], [data-testid="stExpander"] summary, [data-testid="stWidgetLabel"],
+[data-testid="stMetricLabel"] { direction: rtl; text-align: right; }
+.flag { background:#FDECEA; color:#8A1C12; border-radius:4px; padding:2px 8px; margin:2px 0;
+        display:inline-block; font-size:0.9rem; }
+.reason { border-right:3px solid #0E7C86; padding:2px 10px; margin:4px 0; }
+.news-pos { color:#0B6B3A; font-weight:600; } .news-neg { color:#A61B1B; font-weight:600; }
+.small { color:#5B6573; font-size:0.85rem; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# גרסאות שמורות במטמון של משיכת הנתונים
+# ---------------------------------------------------------------------------
+
+class EmptyResult(Exception):
+    """נזרק כשמקור מחזיר תוצאה ריקה, כדי שהמטמון לא ישמור כישלון."""
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def c_universe(min_cap, max_cap, min_price, min_vol, max_n):
+    df, errs = src.get_universe(min_cap, max_cap, min_price, min_vol, max_n)
+    if df.empty:
+        raise EmptyResult(" | ".join(errs) or "לא התקבלו מניות")
+    return df, errs
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def c_history(tickers: tuple[str, ...]):
+    out = src.get_history(list(tickers))
+    if not out:
+        raise EmptyResult("מקורות המחירים (Nasdaq ו-Stooq) לא החזירו נתונים")
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def c_apewisdom():
+    return src.get_apewisdom()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def c_trending():
+    return src.get_stocktwits_trending()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def c_cik_map(email):
+    return src.get_cik_map(email) if email else {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def c_press():
+    return src.get_press_releases()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def c_deep(ticker, name, mcap, price, email, finnhub_key, use_twits, cik_map_items):
+    cik_map = dict(cik_map_items)
+    news = src.merge_news(src.get_news_google(ticker, name), src.get_news_finnhub(ticker, finnhub_key))
+    return {
+        "info": src.get_info(ticker, mcap, price),
+        "news": news,
+        "filings": src.get_filings(ticker, cik_map, email) if email else [],
+        "twits": src.get_stocktwits_stream(ticker) if use_twits else None,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def c_intraday(ticker):
+    return src.get_intraday(ticker)
+
+
+# ---------------------------------------------------------------------------
+# משקלות: הכיול האחרון נשמר אוטומטית (בקובץ בשרת ובכתובת הדף), אחרת ברירת מחדל
+# ---------------------------------------------------------------------------
+
+DEFAULT_WEIGHTS = {"tech": 35, "catalyst": 30, "social": 20, "structure": 15}
+WEIGHTS_FILE = Path(__file__).parent / "calibrated_weights.json"
+RECALIBRATE_DAYS = 14
+
+
+def load_calibration() -> dict | None:
+    """מחזיר את הכיול העדכני ביותר מבין הקובץ בשרת לבין הכתובת. הקובץ נמחק כשהאפליקציה
+    מאותחלת מחדש, ולכן הכתובת משמשת גיבוי."""
+    found = []
+    try:
+        found.append(json.loads(WEIGHTS_FILE.read_text()))
+    except Exception:
+        pass
+    qp = st.query_params
+    if all(str(qp.get(f"w_{k}", "")).isdigit() for k in DEFAULT_WEIGHTS) and qp.get("w_date"):
+        found.append({"weights": {k: int(qp[f"w_{k}"]) for k in DEFAULT_WEIGHTS}, "date": qp["w_date"]})
+    found = [f for f in found if set(f.get("weights", {})) >= set(DEFAULT_WEIGHTS) and f.get("date")]
+    return max(found, key=lambda f: f["date"]) if found else None
+
+
+def save_calibration(weights: dict) -> dict:
+    cal = {"weights": {k: int(weights[k]) for k in DEFAULT_WEIGHTS},
+           "date": datetime.now().strftime("%Y-%m-%dT%H:%M")}
+    try:
+        WEIGHTS_FILE.write_text(json.dumps(cal))
+    except Exception:
+        pass
+    for k, v in cal["weights"].items():
+        st.query_params[f"w_{k}"] = str(v)
+    st.query_params["w_date"] = cal["date"]
+    return cal
+
+
+calibration = load_calibration()
+if calibration and calibration["date"] != st.query_params.get("w_date"):
+    for k, v in calibration["weights"].items():  # שומר בכתובת גם כיול שנטען מהקובץ
+        st.query_params[f"w_{k}"] = str(v)
+    st.query_params["w_date"] = calibration["date"]
+if "pending_weights" in st.session_state:
+    for k, v in st.session_state.pop("pending_weights").items():
+        st.session_state[f"w_{k}"] = int(v)
+for k, v in DEFAULT_WEIGHTS.items():
+    if f"w_{k}" not in st.session_state:
+        st.session_state[f"w_{k}"] = calibration["weights"][k] if calibration else v
+
+
+# ---------------------------------------------------------------------------
+# סרגל צד: הגדרות
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("הגדרות סריקה")
+    with st.form("settings"):
+        cap_min, cap_max = st.slider("שווי שוק (מיליון $)", 1, 500, (5, 200))
+        min_price = st.number_input("מחיר מינימלי ($)", 0.05, 50.0, 0.5, 0.05)
+        min_vol = st.number_input("מחזור יומי ממוצע מינימלי (מניות)", 0, 5_000_000, 100_000, 50_000)
+        max_n = st.slider("כמה מניות לסרוק", 100, 600, 300, 50,
+                          help="מתוך כל המניות בטווח, הכי פעילות והכי מזנקות היום. יותר מניות = סריקה איטית יותר")
+        deep_n = st.slider("כמה מניות לנתח לעומק", 10, 80, 30,
+                           help="המניות המובילות בשלב הראשון מקבלות ניתוח מלא: Float, שורט, חדשות, דיווחים")
+        watchlist = st.text_input("רשימת מעקב (מופרדת בפסיקים)", "",
+                                  help="מניות שתמיד ינותחו, גם אם לא עברו את הסינון")
+
+        st.subheader("משקלות")
+        if calibration:
+            cal_dt = datetime.fromisoformat(calibration["date"])
+            age = (datetime.now() - cal_dt).days
+            st.caption(f"מכיול מ-{cal_dt:%d/%m/%Y}" + (f" · עברו {age} ימים, כדאי לכייל מחדש"
+                                                        if age >= RECALIBRATE_DAYS else ""))
+        else:
+            st.caption("ברירת מחדל. אפשר לכייל בלשונית \"כיול משקלות\".")
+        w_tech = st.slider("טכני", 0, 100, key="w_tech")
+        w_cat = st.slider("קטליזטורים (חדשות ודיווחים)", 0, 100, key="w_catalyst")
+        w_soc = st.slider("רשתות חברתיות", 0, 100, key="w_social")
+        w_str = st.slider("מבנה (מניות ושורט)", 0, 100, key="w_structure")
+
+        st.subheader("מקורות")
+        sec_email = st.text_input("מייל לזיהוי מול SEC", "",
+                                  help="ה-SEC דורש כתובת מייל בכל בקשה. בלי זה לא ייבדקו דיווחים רשמיים.")
+        finnhub_key = st.text_input("מפתח Finnhub (אופציונלי, חינמי)", "", type="password")
+        use_twits = st.checkbox("לנסות StockTwits", True,
+                                help="לפעמים StockTwits חוסם גישה אוטומטית. אם כך, הסריקה תמשיך בלעדיו.")
+        run = st.form_submit_button("הרץ סריקה", type="primary", use_container_width=True)
+
+    if st.button("נקה מטמון נתונים", use_container_width=True):
+        st.cache_data.clear()
+        st.success("המטמון נוקה. הסריקה הבאה תמשוך הכול מחדש.")
+
+weights = {"tech": w_tech, "catalyst": w_cat, "social": w_soc, "structure": w_str}
+
+
+# ---------------------------------------------------------------------------
+# צינור הסריקה
+# ---------------------------------------------------------------------------
+
+def run_scan():
+    log: list[str] = []
+    prog = st.progress(0.0, "מאתר מניות שעומדות בסינון...")
+
+    try:
+        uni, errs = c_universe(cap_min * 1e6, cap_max * 1e6, min_price, min_vol, max_n)
+        log += errs
+    except EmptyResult as e:
+        uni = pd.DataFrame()
+        log.append(f"איתור מניות נכשל: {e}")
+    wl = [t.strip().upper() for t in watchlist.split(",") if t.strip()]
+    tickers = list(dict.fromkeys((uni["ticker"].tolist() if not uni.empty else []) + wl))
+    if not tickers:
+        prog.empty()
+        st.error("לא נמצאו מניות. " + " ".join(log) + " נסו שוב בעוד כמה דקות, או הזינו רשימת מעקב.")
+        return
+    meta = uni.set_index("ticker").to_dict("index") if not uni.empty else {}
+
+    prog.progress(0.15, f"מוריד היסטוריית מחירים ל-{len(tickers)} מניות...")
+    try:
+        hist = c_history(tuple(sorted(tickers)))
+    except EmptyResult as e:
+        prog.empty()
+        st.error(f"נמצאו {len(tickers)} מניות, אבל {e}. נסו שוב בעוד כמה דקות.")
+        return
+
+    prog.progress(0.45, "בודק אזכורים ברשתות...")
+    ape = c_apewisdom()
+    if not ape:
+        log.append("ApeWisdom (אזכורים ברדיט) לא הגיב")
+    trending = c_trending() if use_twits else set()
+    press = c_press()
+    if not press:
+        log.append("פיד ההודעות לעיתונות לא הגיב")
+
+    # שלב 1: ניקוד טכני + חברתי לכל המניות
+    stage1 = []
+    for t in tickers:
+        tech = sc.compute_technicals(hist.get(t))
+        if not tech:
+            continue
+        ts, tr = sc.score_technical(tech)
+        ss, sr = sc.score_social(ape.get(t), {"trending": t in trending} if t in trending else None)
+        prelim = (ts * w_tech + ss * w_soc) / max(w_tech + w_soc, 1)
+        stage1.append({"ticker": t, "tech": tech, "ts": ts, "tr": tr, "ss": ss, "prelim": prelim})
+    stage1.sort(key=lambda r: r["prelim"], reverse=True)
+
+    by_t = {r["ticker"]: r for r in stage1}
+    have = set(by_t)
+    # מניות שהוציאו הודעה לעיתונות ב-36 השעות האחרונות נכנסות תמיד לניתוח עומק
+    press_hits = [t for t, items in press.items() if t in have and
+                  any(i.get("ts") and (datetime.now(timezone.utc) - i["ts"]).total_seconds() < 36 * 3600 for i in items)]
+    deep_set = [r["ticker"] for r in stage1[:deep_n]] + [t for t in wl if t in have] + press_hits
+    deep_set = list(dict.fromkeys(deep_set))
+
+    # שלב 2: ניתוח עומק
+    prog.progress(0.55, f"מנתח לעומק {len(deep_set)} מניות (חדשות, דיווחים, Float)...")
+    cik_items = tuple(sorted(c_cik_map(sec_email).items())) if sec_email else tuple()
+    if sec_email and not cik_items:
+        log.append("SEC EDGAR לא הגיב; דיווחים רשמיים לא נבדקו")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {t: ex.submit(c_deep, t, meta.get(t, {}).get("name") or "", meta.get(t, {}).get("mcap"),
+                                       by_t[t]["tech"]["price"], sec_email, finnhub_key, use_twits, cik_items) for t in deep_set}
+        deep = {}
+        for i, (t, f) in enumerate(futures.items()):
+            try:
+                deep[t] = f.result()
+            except Exception as e:
+                log.append(f"{t}: {e}")
+            prog.progress(0.55 + 0.4 * (i + 1) / len(futures), f"מנתח {t}...")
+
+    rows, details = [], {}
+    for t in deep_set:
+        r, d = by_t[t], dict(deep.get(t, {}))
+        d["info"] = {**d.get("info", {}), **{k: meta.get(t, {}).get(k) for k in ("sector", "industry", "country")}}
+        d["news"] = src.merge_news(press.get(t, []), d.get("news", []))
+        fresh = [n["ts"] for n in d["news"] if n.get("ts")]
+        news_age = (datetime.now(timezone.utc) - max(fresh)).total_seconds() / 3600 if fresh else None
+        tech, info = r["tech"], d.get("info", {})
+        twits = d.get("twits") or {}
+        if t in trending:
+            twits["trending"] = True
+        st_s, st_r = sc.score_structure(info.get("floatShares"), info.get("shortPercentOfFloat"),
+                                        tech["vol_today"], info.get("sharesOutstanding"))
+        ca_s, ca_r, ca_info = sc.score_catalyst(d.get("news", []), d.get("filings", []))
+        so_s, so_r = sc.score_social(ape.get(t), twits or None)
+        flags = sc.red_flags(tech, ca_info, so_s, ca_s)
+        scores = {"tech": r["ts"], "catalyst": ca_s, "social": so_s, "structure": st_s}
+        total = sc.composite(scores, weights, flags.penalty)
+        mcap = (meta.get(t, {}).get("mcap") or info.get("marketCap") or 0) / 1e6
+        fl = info.get("floatShares") or info.get("sharesOutstanding")
+        sp = info.get("shortPercentOfFloat")
+        rows.append({
+            "טיקר": t, "שם": meta.get(t, {}).get("name") or info.get("longName") or "",
+            "ציון": round(total), "מחיר": tech["price"], "שינוי %": tech["chg_pct"],
+            "RVOL": tech["rvol"], "שווי M$": mcap, "מניות M": fl / 1e6 if fl else None,
+            "שורט %": (sp * 100 if sp and sp < 1 else sp), "טכני": round(r["ts"]),
+            "קטליזטור": round(ca_s), "חברתי": round(so_s), "מבנה": round(st_s),
+            "חדשה אחרונה (שעות)": round(news_age) if news_age is not None else None,
+            "דגלים": len(flags.items),
+        })
+        details[t] = {"scores": scores, "total": total, "tech": tech, "info": info,
+                      "news": d.get("news", []), "filings": d.get("filings", []),
+                      "reasons": r["tr"] + ca_r + so_r + st_r, "flags": flags.items,
+                      "ape": ape.get(t), "twits": twits}
+
+    others = pd.DataFrame([{
+        "טיקר": r["ticker"], "מחיר": r["tech"]["price"], "שינוי %": r["tech"]["chg_pct"],
+        "RVOL": r["tech"]["rvol"], "טכני": round(r["ts"]), "חברתי": round(r["ss"]),
+    } for r in stage1 if r["ticker"] not in details])
+
+    prog.empty()
+    st.session_state.update({
+        "results": pd.DataFrame(rows).sort_values("ציון", ascending=False) if rows else pd.DataFrame(),
+        "details": details, "others": others, "log": log,
+        "scanned_at": datetime.now(), "n_universe": len(tickers), "n_hist": len(stage1),
+    })
+
+
+if run:
+    run_scan()
+
+
+# ---------------------------------------------------------------------------
+# עזרי תצוגה
+# ---------------------------------------------------------------------------
+
+def ago(ts):
+    if not ts:
+        return ""
+    h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    if h < 1:
+        return f"לפני {int(h * 60)} דק׳"
+    if h < 48:
+        return f"לפני {int(h)} שעות"
+    return f"לפני {int(h / 24)} ימים"
+
+
+def daily_chart(df: pd.DataFrame, ticker: str):
+    df = df.tail(130)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                                 name=ticker, increasing_line_color="#0B8A5A", decreasing_line_color="#C0392B"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"].rolling(20).mean(), name="ממוצע 20",
+                             line=dict(color="#0E7C86", width=1.4)), row=1, col=1)
+    colors = ["#0B8A5A" if c >= o else "#C0392B" for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=colors, name="נפח"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Volume"].rolling(20).mean(), name="נפח ממוצע",
+                             line=dict(color="#5B6573", width=1, dash="dot")), row=2, col=1)
+    fig.update_layout(height=520, margin=dict(l=10, r=10, t=10, b=10), showlegend=False,
+                      xaxis_rangeslider_visible=False, plot_bgcolor="white")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor="#EEF1F5")
+    fig.update_yaxes(gridcolor="#EEF1F5")
+    return fig
+
+
+def intraday_chart(df: pd.DataFrame, ticker: str):
+    fig = go.Figure(go.Scatter(x=df.index, y=df["Price"], line=dict(color="#0E7C86", width=1.6)))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), plot_bgcolor="white")
+    fig.update_xaxes(gridcolor="#EEF1F5")
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# מסך ראשי
+# ---------------------------------------------------------------------------
+
+st.title("סורק מומנטום למניות קטנות")
+st.caption("גרסה 4.1 · מקורות: Nasdaq, SEC, Google News, GlobeNewswire, PR Newswire, Reddit, StockTwits")
+
+tab_scan, tab_cal, tab_model = st.tabs(["סריקה", "כיול משקלות", "איך הציון מחושב"])
+
+with tab_scan:
+    if "results" not in st.session_state:
+        st.info("הגדירו את הסינון בסרגל הצד ולחצו על **הרץ סריקה**. סריקה ראשונה לוקחת בערך דקה עד שתיים; "
+                "הבאות מהירות יותר בזכות המטמון. מומלץ להזין מייל כדי לקבל גם דיווחי SEC.")
+    else:
+        res: pd.DataFrame = st.session_state["results"]
+        det: dict = st.session_state["details"]
+        st.caption(f"נסרק ב-{st.session_state['scanned_at']:%d/%m %H:%M} · "
+                   f"{st.session_state['n_universe']} מניות עברו סינון, "
+                   f"{st.session_state['n_hist']} עם נתוני מחיר, {len(det)} נותחו לעומק")
+        for m in st.session_state.get("log", []):
+            st.warning(m)
+
+        if res.empty:
+            st.warning("אף מניה לא נותחה לעומק. נסו להרחיב את הסינון.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("ציון 60 ומעלה", int((res["ציון"] >= 60).sum()))
+            c2.metric("RVOL מעל 3", int((res["RVOL"] >= 3).sum()))
+            c3.metric("עם קטליזטור", int((res["קטליזטור"] >= 20).sum()))
+            c4.metric("עם דגלים אדומים", int((res["דגלים"] > 0).sum()))
+
+            only_clean = st.toggle("הסתר מניות עם דגלים אדומים", False)
+            view = res[res["דגלים"] == 0] if only_clean else res
+
+            st.dataframe(
+                view, hide_index=True, use_container_width=True, height=min(38 * len(view) + 40, 640),
+                column_config={
+                    "ציון": st.column_config.ProgressColumn("ציון", min_value=0, max_value=100, format="%d"),
+                    "מחיר": st.column_config.NumberColumn(format="$%.2f"),
+                    "שינוי %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "RVOL": st.column_config.NumberColumn(format="%.1fx"),
+                    "שווי M$": st.column_config.NumberColumn(format="%.0f"),
+                    "מניות M": st.column_config.NumberColumn(format="%.1f"),
+                    "שורט %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "דגלים": st.column_config.NumberColumn(format="%d ⚠️"),
+                    "חדשה אחרונה (שעות)": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+            st.download_button("הורד כ-CSV", res.to_csv(index=False).encode("utf-8-sig"),
+                               f"scan_{datetime.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+            st.divider()
+            pick = st.selectbox("בחרו מניה לניתוח", view["טיקר"].tolist(),
+                                format_func=lambda t: f"{t}  ·  ציון {int(res.set_index('טיקר').loc[t, 'ציון'])}")
+            if pick:
+                d = det[pick]
+                info, tech = d["info"], d["tech"]
+                st.subheader(f"{pick} · {info.get('longName') or ''}")
+                st.caption(" · ".join(x for x in [info.get("sector"), info.get("industry"), info.get("country")] if x))
+                st.markdown(
+                    f"[Nasdaq](https://www.nasdaq.com/market-activity/stocks/{pick.lower()}) · "
+                    f"[Finviz](https://finviz.com/quote.ashx?t={pick}) · "
+                    f"[StockTwits](https://stocktwits.com/symbol/{pick}) · "
+                    f"[SEC](https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={pick}&type=&dateb=&owner=include&count=40)")
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("ציון", f"{d['total']:.0f}")
+                m2.metric("מחיר", f"${tech['price']:.2f}", f"{tech['chg_pct']:+.1f}%")
+                m3.metric("RVOL", f"{tech['rvol']:.1f}x")
+                fl = info.get("floatShares") or info.get("sharesOutstanding")
+                m4.metric("מניות", f"{fl / 1e6:.1f}M" if fl else "לא ידוע")
+                m5.metric("RSI", f"{tech['rsi']:.0f}")
+
+                left, right = st.columns([3, 2])
+                with left:
+                    ch1, ch2 = st.tabs(["גרף יומי", "תוך-יומי (יום המסחר האחרון)"])
+                    with ch1:
+                        try:
+                            h = c_history((pick,)).get(pick)
+                        except EmptyResult:
+                            h = None
+                        if h is not None and not h.empty:
+                            st.plotly_chart(daily_chart(h, pick), use_container_width=True)
+                    with ch2:
+                        intr = c_intraday(pick)
+                        if intr is not None and not intr.empty:
+                            st.plotly_chart(intraday_chart(intr, pick), use_container_width=True)
+                        else:
+                            st.caption("אין נתונים תוך-יומיים זמינים כרגע.")
+                with right:
+                    s = d["scores"]
+                    st.markdown("**פירוק הציון**")
+                    for k, lbl in [("tech", "טכני"), ("catalyst", "קטליזטור"), ("social", "חברתי"), ("structure", "מבנה")]:
+                        st.progress(int(s[k]) / 100, f"{lbl}: {s[k]:.0f}")
+                    st.markdown("**למה היא ברשימה**")
+                    for r in d["reasons"] or ["אין סיגנל בולט מעבר לציון הטכני"]:
+                        st.markdown(f"<div class='reason'>{r}</div>", unsafe_allow_html=True)
+                    if d["flags"]:
+                        st.markdown("**דגלים אדומים**")
+                        for f in d["flags"]:
+                            st.markdown(f"<span class='flag'>⚠️ {f}</span>", unsafe_allow_html=True)
+
+                n_col, f_col = st.columns([3, 2])
+                with n_col:
+                    st.markdown("**חדשות אחרונות**")
+                    if not d["news"]:
+                        st.caption("לא נמצאו חדשות. אפשר להוסיף מפתח Finnhub לכיסוי רחב יותר.")
+                    for n in d["news"][:15]:
+                        age_h = ((datetime.now(timezone.utc) - n["ts"]).total_seconds() / 3600) if n.get("ts") else 999
+                        old = age_h > 24 * 7
+                        pts = n.get("score", 0)
+                        badge = (f"<span class='news-pos'>+{pts}</span>" if pts > 0 else
+                                 f"<span class='news-neg'>{pts}</span>" if pts < 0 else "")
+                        title = n["title"].replace("[", "(").replace("]", ")")
+                        link = f"<a href='{n['url']}' target='_blank'>{title}</a>" if n.get("url") else title
+                        pr = "📣 " if n.get("press") else ""
+                        style = "text-align:left;opacity:0.45" if old else "text-align:left"
+                        note = " · ישנה, לא נספרת בציון" if old else ""
+                        st.markdown(f"<div dir='ltr' style='{style}'>{pr}{badge} {link}<br>"
+                                    f"<span class='small'>{n.get('source', '')} · {ago(n.get('ts'))}{note}</span></div>",
+                                    unsafe_allow_html=True)
+                with f_col:
+                    st.markdown("**דיווחי SEC (45 יום)**")
+                    if not d["filings"]:
+                        st.caption("אין דיווחים, או שלא הוזן מייל ל-SEC.")
+                    for f in d["filings"][:15]:
+                        dil = " ⚠️" if f["form"] in sc.DILUTION_FORMS else ""
+                        items = f" (פריטים {f['items']})" if f.get("items") else ""
+                        link = f"[{f['form']}]({f['url']})" if f.get("url") else f["form"]
+                        st.markdown(f"{f['date']:%d/%m} · {link}{items}{dil}")
+                    st.markdown("**רשתות**")
+                    a, tw = d.get("ape"), d.get("twits") or {}
+                    st.caption(f"רדיט: {a['mentions']} אזכורים (אתמול {a['mentions_24h_ago']})" if a
+                               else "רדיט: לא ברשימת המוזכרות")
+                    if tw.get("msgs_per_hour") is not None and "msgs_per_hour" in tw:
+                        br = f", {tw['bull_ratio']:.0%} שוריים" if tw.get("bull_ratio") is not None else ""
+                        st.caption(f"StockTwits: {tw['msgs_per_hour']:.1f} הודעות לשעה{br}")
+
+        others = st.session_state.get("others")
+        if others is not None and not others.empty:
+            with st.expander(f"שאר המניות שנסרקו ({len(others)}), ניקוד ראשוני בלבד"):
+                st.dataframe(others.sort_values("טכני", ascending=False), hide_index=True,
+                             use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# כיול משקלות
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def c_bt_universe(min_cap, max_cap, min_price):
+    df, errs = src.get_universe(min_cap, max_cap, min_price, 0, 0, prune=False)
+    if df.empty:
+        raise EmptyResult(" | ".join(errs) or "לא התקבלו מניות")
+    return df
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def c_bt_history(tickers: tuple[str, ...]):
+    out = src.get_history(list(tickers))
+    if not out:
+        raise EmptyResult("מקורות המחירים לא החזירו נתונים")
+    return out
+
+
+with tab_cal:
+    st.markdown("""
+הניתוח הזה בודק את ימי המסחר האחרונים: בכל יום הוא מוצא את המניות שעלו הכי הרבה, ומחשב מחדש את הציונים
+שהיו להן **ביום שלפני הזינוק**. אחר כך הוא משווה אותן לכל שאר המניות באותו יום, כדי לראות איזה רכיב באמת
+מבדיל בין מזנקות לשאר, ולפי זה מציע משקלות.
+
+חדשות נספרות עד פתיחת המסחר ביום הזינוק, כי סריקה ב-15:30 שעון ישראל רואה גם אותן.
+את הרכיב החברתי אי אפשר לשחזר לאחור (אין היסטוריה חינמית של אזכורים), ולכן המשקל שלו נשאר כפי שהוא.
+""")
+    c1, c2, c3 = st.columns(3)
+    bt_days = c1.slider("ימי מסחר לבדיקה", 5, 20, 10)
+    bt_top = c2.slider("כמה מזנקות בכל יום", 5, 20, 10)
+    bt_n = c3.slider("גודל מדגם המניות", 200, 1500, 800, 100,
+                     help="מדגם אקראי מכל המניות בטווח שווי השוק. יותר = מדויק יותר ואיטי יותר")
+    bt_cat = st.checkbox("כולל קטליזטורים (חדשות ודיווחי SEC). איטי יותר, ודורש מייל בסרגל הצד", True)
+    bt_smooth = st.checkbox("שינוי הדרגתי: לזוז חצי דרך מהמשקלות הנוכחיים למוצעים", True,
+                            help="עשרה ימים הם מדגם קטן. שינוי הדרגתי מונע קפיצות חדות בין כיול לכיול, "
+                                 "ואחרי כמה כיולים המשקלות מתייצבים סביב מה שהנתונים מראים.")
+
+    if st.button("הרץ כיול", type="primary"):
+        prog = st.progress(0.0, "טוען את רשימת המניות...")
+        try:
+            uni = c_bt_universe(cap_min * 1e6, cap_max * 1e6, min_price)
+            uni = uni.sample(min(bt_n, len(uni)), random_state=7)
+            meta = {r.ticker: {"name": r.name, "shares": (r.mcap / r.q_price) if r.q_price else None}
+                    for r in uni.itertuples()}
+            prog.progress(0.1, f"מוריד היסטוריית מחירים ל-{len(uni)} מניות (עד כמה דקות בפעם הראשונה)...")
+            hist = c_bt_history(tuple(sorted(meta)))
+            prog.progress(0.5, "מחשב ציונים ליום שלפני כל זינוק...")
+            panel, days = bt.build_panel(hist, meta, bt_days, bt_top)
+            cat = None
+            if bt_cat and not panel.empty:
+                if not sec_email:
+                    st.warning("לא הוזן מייל ל-SEC, אז נבדקות רק חדשות ולא דיווחים רשמיים.")
+                prog.progress(0.6, "בודק חדשות ודיווחים של המזנקות ושל מדגם ביקורת...")
+                cat = bt.add_catalysts(panel, meta, sec_email, bt_top, True,
+                                       progress=lambda x: prog.progress(0.6 + 0.38 * x,
+                                                                        "בודק חדשות ודיווחים..."))
+            cur = {k: st.session_state[f"w_{k}"] for k in DEFAULT_WEIGHTS}
+            summary = bt.summarize(panel, cat, cur)
+            st.session_state["bt"] = (panel, cat, summary, len(hist), days)
+            if not panel.empty:
+                suggested = summary[2]
+                final = ({k: (cur[k] + suggested[k]) / 2 for k in DEFAULT_WEIGHTS} if bt_smooth
+                         else dict(suggested))
+                final = {k: int(round(v)) for k, v in final.items()}
+                final["tech"] += 100 - sum(final.values())
+                save_calibration(final)
+                st.session_state["pending_weights"] = final
+                st.session_state["bt_change"] = (cur, suggested, final)
+                prog.empty()
+                st.rerun()
+        except EmptyResult as e:
+            st.error(f"הכיול נכשל: {e}")
+        prog.empty()
+
+    if "bt" in st.session_state:
+        panel, cat, (comp_df, feat_df, new_w, perf), n_hist, days = st.session_state["bt"]
+        if panel.empty:
+            st.warning("לא היו מספיק נתונים לניתוח.")
+        else:
+            st.caption(f"{n_hist} מניות עם נתונים · {days[0]:%d/%m} עד {days[-1]:%d/%m} · "
+                       f"{int(panel['gainer'].sum())} מקרי זינוק")
+
+            st.markdown("**איזה רכיב מבדיל בין המזנקות לשאר**")
+            st.dataframe(comp_df.drop(columns="key"), hide_index=True, use_container_width=True, column_config={
+                "מזנקות": st.column_config.NumberColumn("ציון ממוצע: מזנקות", format="%.1f"),
+                "שאר המניות": st.column_config.NumberColumn("ציון ממוצע: שאר המניות", format="%.1f"),
+                "AUC": st.column_config.ProgressColumn("כוח הבחנה (AUC)", min_value=0, max_value=1,
+                                                       format="%.2f"),
+            })
+            st.caption("AUC הוא הסיכוי שמניה שזינקה קיבלה ציון גבוה יותר ממניה אקראית אחרת. "
+                       "0.50 = הרכיב לא אומר כלום; 0.60 ומעלה = סיגנל ממשי.")
+
+            st.markdown("**מאפיינים ביום שלפני הזינוק**")
+            st.dataframe(feat_df, hide_index=True, use_container_width=True, column_config={
+                "% מהמזנקות": st.column_config.NumberColumn(format="%.0f%%"),
+                "% משאר המניות": st.column_config.NumberColumn(format="%.0f%%"),
+                "פי כמה נפוץ יותר": st.column_config.NumberColumn(format="x%.1f"),
+            })
+
+            p1, p2, p3 = st.columns(3)
+            p1.metric("תשואה ממוצעת למחרת: 20 המובילות בציון", f"{perf['top20_avg_ret']:+.1f}%",
+                      f"{perf['top20_avg_ret'] - perf['all_avg_ret']:+.1f}% מול כל המניות")
+            p2.metric("מתוכן הפכו למזנקות היום", f"{perf['top20_hit']:.1f}%",
+                      f"{perf['top20_hit'] - perf['base_hit']:+.1f}% מול בחירה אקראית")
+            p3.metric("עלו 20% ומעלה למחרת", f"{perf['top20_big']:.1f}%",
+                      f"{perf['top20_big'] - perf['all_big']:+.1f}% מול כל המניות")
+
+            if "bt_change" in st.session_state:
+                before, suggested, final = st.session_state["bt_change"]
+                st.success("המשקלות באפליקציה עודכנו לפי הכיול.")
+                labels = {"tech": "טכני", "catalyst": "קטליזטור", "social": "חברתי", "structure": "מבנה"}
+                st.dataframe(pd.DataFrame([{"רכיב": labels[k], "לפני": before[k], "לפי הנתונים": suggested[k],
+                                            "עכשיו בשימוש": final[k]} for k in DEFAULT_WEIGHTS]),
+                             hide_index=True)
+                if cat is None:
+                    st.caption("הקטליזטורים לא נבדקו בהרצה הזו, אז המשקל שלהם לא השתנה.")
+                st.caption("המשקלות נשמרים אוטומטית. אם האפליקציה מאותחלת מחדש, הם נטענים מכתובת הדף, "
+                           "אז כדאי לשמור במועדפים את הקישור כפי שהוא מופיע עכשיו בדפדפן.")
+
+            with st.expander("המזנקות בכל יום והציונים שלהן ביום שלפני"):
+                g = (cat[cat["gainer"]] if cat is not None else panel[panel["gainer"]]).sort_values(
+                    ["date", "ret"], ascending=[False, False])
+                cols = ["date", "ticker", "ret", "tech", "structure"] + (["catalyst"] if cat is not None else [])
+                st.dataframe(g[cols].rename(columns={"date": "תאריך", "ticker": "טיקר", "ret": "עלייה %",
+                                                     "tech": "טכני", "structure": "מבנה",
+                                                     "catalyst": "קטליזטור"}),
+                             hide_index=True, use_container_width=True, column_config={
+                                 "תאריך": st.column_config.DateColumn(format="DD/MM"),
+                                 "עלייה %": st.column_config.NumberColumn(format="%+.0f%%"),
+                                 "טכני": st.column_config.NumberColumn(format="%.0f"),
+                                 "מבנה": st.column_config.NumberColumn(format="%.0f"),
+                                 "קטליזטור": st.column_config.NumberColumn(format="%.0f"),
+                             })
+            st.caption(f"מומלץ להריץ כיול חדש כל {RECALIBRATE_DAYS} יום בערך. הסרגל הצדדי יזכיר לך כשהגיע הזמן.")
+
+
+with tab_model:
+    st.markdown("""
+הסורק עובד בשני שלבים. בשלב הראשון כל המניות שעברו את סינון שווי השוק מקבלות ציון טכני וחברתי,
+שמבוססים על נתונים שאפשר למשוך במהירות לכולן. בשלב השני המניות המובילות מקבלות ניתוח מלא.
+
+**טכני (0-100).** המרכיב הכבד ביותר הוא RVOL, כלומר נפח המסחר היום ביחס לממוצע 20 הימים; RVOL של 5 ומעלה נותן את מלוא 35 הנקודות.
+נקודות נוספות ניתנות על עלייה בנפח כבר בימים שלפני היום (איסוף), פריצה מעל שיא 20 ימים, במיוחד אחרי דשדוש צר,
+קרבה לשיא שנתי, ועלייה יומית סבירה של 3% עד 40%. מניה שכבר עלתה מעל 100% מקבלת פחות ודגל.
+
+**קטליזטור (0-100).** חדשות נאספות מ-Google News ומ-Finnhub (אם הוזן מפתח), ובנוסף מפיד ההודעות לעיתונות
+של GlobeNewswire ו-PR Newswire. מניה שהוציאה הודעה לעיתונות ב-36 השעות האחרונות נכנסת תמיד לניתוח עומק.
+כותרות מהשבוע האחרון נסרקות למילות מפתח עם משקלות: אישורי FDA, תוצאות ניסויים, חוזים,
+שותפויות, רכישות ונושאים חמים מקבלים נקודות; הנפקות, פיצול הפוך, מחיקה מהמסחר ופשיטת רגל מורידים.
+כותרות מהיממה האחרונה שוות יותר. בנוסף נבדקים דיווחי SEC: פריטים מסוימים ב-8-K, דיווחי 13D ודיווחי Form 4.
+
+**חברתי (0-100).** העיקר הוא קצב השינוי באזכורים ברדיט לעומת אתמול, ולא הכמות עצמה.
+נוספים לזה טרנדינג וקצב הודעות ב-StockTwits.
+
+**מבנה (0-100).** מספר מניות נמוך (Float אמיתי לא זמין בחינם, אז משתמשים בכמות המניות הכוללת כקירוב), אחוז שורט גבוה, ונפח יומי שמתקרב לגודל ה-Float או עובר אותו.
+
+**דגלים אדומים** מורידים נקודות מהציון הסופי: דיווח הנפקה או רישום מניות ב-45 הימים האחרונים,
+באזז ברשתות בלי שום קטליזטור (דפוס נפוץ של קידום בתשלום), שפה קידומית בכותרות, נזילות נמוכה ו-RSI קיצוני.
+
+המשקלות בסרגל הצד קובעים את התרומה של כל רכיב. מילות המפתח והמשקלות שלהן נמצאים בקובץ `scoring.py`
+ואפשר לשנות אותם לפי הניסיון שלכם.
+""")
+    st.caption("הכלי הזה מזהה סיגנלים, לא ממליץ על קנייה או מכירה. במניות בגודל הזה רוב הסיגנלים לא מבשילים, "
+               "ותנועות חדות לשני הכיוונים הן חלק מהשגרה.")
