@@ -44,7 +44,7 @@ def _num(val) -> float:
 
 
 def get_universe(min_cap: float, max_cap: float, min_price: float, min_vol: float,
-                        max_n: int) -> tuple[pd.DataFrame, list[str]]:
+                        max_n: int, prune: bool = True) -> tuple[pd.DataFrame, list[str]]:
     """כל המניות ב-NASDAQ/NYSE/AMEX בבקשה אחת, מהסורק הציבורי של nasdaq.com."""
     data = _get_json("https://api.nasdaq.com/api/screener/stocks", headers=NASDAQ_HEADERS,
                      params={"tableonly": "true", "limit": "25000", "download": "true"}, timeout=30)
@@ -67,6 +67,8 @@ def get_universe(min_cap: float, max_cap: float, min_price: float, min_vol: floa
     df = pd.DataFrame(recs)
     if df.empty:
         return df, ["הסורק של Nasdaq החזיר 0 מניות בטווח"]
+    if not prune:
+        return df, []
     # לא מורידים היסטוריה לאלפי מניות: לוקחים את הפעילות ביותר ואת המזנקות ביותר
     by_vol = df.assign(dv=df.q_vol * df.q_price).nlargest(int(max_n * 0.6), "dv")
     by_chg = df.nlargest(int(max_n * 0.4), "q_chg")
@@ -243,13 +245,15 @@ def _relevant(title: str, ticker: str, cname: str) -> bool:
     return len(first) >= 4 and first not in _GENERIC_WORDS and re.search(rf"\b{re.escape(first)}\b", tl) is not None
 
 
-def get_news_google(ticker: str, name: str, days: int = 7) -> list[dict]:
+def get_news_google(ticker: str, name: str, days: int = 7, after: str | None = None,
+                    before: str | None = None) -> list[dict]:
     """Google News RSS: כולל הודעות לעיתונות מ-GlobeNewswire, PR Newswire, Accesswire ועוד."""
     cname = clean_company_name(name)
     parts = [f'"{ticker} stock"', f'"NASDAQ:{ticker}"', f'"NYSE:{ticker}"']
     if len(cname) >= 4:
         parts.insert(0, f'"{cname}"')
-    q = " OR ".join(parts) + f" when:{days}d"
+    window = f" after:{after} before:{before}" if after and before else f" when:{days}d"
+    q = " OR ".join(parts) + window
     raw = _parse_rss(_get_text("https://news.google.com/rss/search",
                                {"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"}))
     out = []

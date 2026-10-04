@@ -189,23 +189,25 @@ def score_headline(title: str) -> tuple[int, list[str]]:
     return pts, hits
 
 
-def _age_hours(ts: datetime | None) -> float:
+def _age_hours(ts: datetime | None, ref: datetime | None = None) -> float:
     if ts is None:
         return 999.0
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return max((datetime.now(timezone.utc) - ts).total_seconds() / 3600, 0)
+    ref = ref or datetime.now(timezone.utc)
+    return (ref - ts).total_seconds() / 3600
 
 
-def score_catalyst(news: list[dict], filings: list[dict]) -> tuple[float, list[str], dict]:
+def score_catalyst(news: list[dict], filings: list[dict],
+                   ref: datetime | None = None) -> tuple[float, list[str], dict]:
     """news: [{title, ts, ...}], filings: [{form, date, items, ...}]"""
     s, r = 0.0, []
     info = {"dilution_filing": False, "promo_news": 0, "neg_news": False, "fresh_news": 0}
 
     best_title, best_pts = None, 0
     for n in news:
-        age = _age_hours(n.get("ts"))
-        if age > 24 * 7:
+        age = _age_hours(n.get("ts"), ref)
+        if age > 24 * 7 or age < 0:
             continue
         pts, hits = score_headline(n.get("title", ""))
         n["score"], n["hits"] = pts, hits
@@ -224,7 +226,9 @@ def score_catalyst(news: list[dict], filings: list[dict]) -> tuple[float, list[s
 
     form4 = 0
     for f in filings:
-        age_days = _age_hours(f.get("date")) / 24
+        age_days = _age_hours(f.get("date"), ref) / 24
+        if age_days < 0:
+            continue
         form = f.get("form", "")
         if form == "8-K" and age_days <= 5:
             for it in (f.get("items") or "").split(","):
